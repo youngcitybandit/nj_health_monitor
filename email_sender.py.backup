@@ -1,0 +1,497 @@
+"""
+Email sender using Gmail API and ChatGPT for content generation.
+"""
+
+import os
+import logging
+from typing import Dict, Any, List
+import openai
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import base64
+import json
+
+logger = logging.getLogger(__name__)
+
+class EmailSender:
+    """Handles email generation and sending using ChatGPT and Gmail API."""
+    
+    # Gmail API scopes
+    SCOPES = ['https://www.googleapis.com/auth/gmail.send']
+    
+    def __init__(self):
+        """Initialize the email sender."""
+        # Initialize OpenAI
+        self.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        # Gmail configuration
+        self.credentials_file = os.getenv('GMAIL_CREDENTIALS_FILE', 'credentials.json')
+        self.token_file = os.getenv('GMAIL_TOKEN_FILE', 'token.json')
+        self.sender_email = os.getenv('SENDER_EMAIL')
+        self.recipient_email = os.getenv('RECIPIENT_EMAIL')
+        
+        # Signature configuration
+        self.sender_name = os.getenv('SENDER_NAME', 'Eric Hansen')
+        self.sender_title = os.getenv('SENDER_TITLE', 'Business Development')
+        self.company_name = os.getenv('COMPANY_NAME', 'PolicyEdge')
+        self.company_website = os.getenv('COMPANY_WEBSITE', 'www.policyedge.com')
+        self.sender_phone = os.getenv('SENDER_PHONE', '(555) 123-4567')
+        
+        if not self.sender_email or not self.recipient_email:
+            raise ValueError("Sender and recipient emails must be provided in environment variables")
+        
+        # Initialize Gmail service
+        self.gmail_service = self._initialize_gmail_service()
+    
+    def _initialize_gmail_service(self):
+        """Initialize the Gmail API service."""
+        try:
+            creds = None
+            
+            # Load existing token
+            if os.path.exists(self.token_file):
+                creds = Credentials.from_authorized_user_file(self.token_file, self.SCOPES)
+            
+            # If there are no valid credentials, request authorization
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    if not os.path.exists(self.credentials_file):
+                        raise FileNotFoundError(f"Gmail credentials file not found: {self.credentials_file}")
+                    
+                    flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, self.SCOPES)
+                    creds = flow.run_local_server(port=0)
+                
+                # Save credentials for next run
+                with open(self.token_file, 'w') as token:
+                    token.write(creds.to_json())
+            
+            # Build the Gmail service
+            service = build('gmail', 'v1', credentials=creds)
+            logger.info("Gmail service initialized successfully")
+            return service
+            
+        except Exception as e:
+            logger.error(f"Error initializing Gmail service: {str(e)}")
+            raise
+    
+    def generate_email_content(self, processed_entries: List[Dict[str, Any]], custom_prompt: str = None) -> str:
+        """
+        Generate email content using ChatGPT.
+        
+        Args:
+            processed_entries: List of processed enforcement action entries
+            custom_prompt: Optional custom prompt to use instead of default
+            
+        Returns:
+            Generated email content
+        """
+        try:
+            # Prepare data for ChatGPT
+            entries_summary = self._prepare_entries_summary(processed_entries)
+            
+            # Use custom prompt if provided, otherwise use default
+            if custom_prompt:
+                prompt = self._create_custom_email_prompt(entries_summary, custom_prompt)
+            else:
+                prompt = self._create_email_prompt(entries_summary, len(processed_entries))
+            
+            # Generate email content using ChatGPT
+            if custom_prompt:
+                # For PolicyEdge custom prompt, expect JSON response
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a business development professional at PolicyEdge. Generate personalized compliance outreach emails in JSON format as specified."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    max_tokens=2000,
+                    temperature=0.7
+                )
+                
+                # Parse JSON response
+                try:
+                    import json
+                    json_response = json.loads(response.choices[0].message.content)
+                    email_subject = json_response.get('email_subject', 'PolicyEdge Risk Intelligence')
+                    email_body = json_response.get('email_body', '')
+                    violation_category = json_response.get('violation_category', '')
+                    
+                    # Replace [Your Name] with actual signature
+                    email_body = self._add_signature(email_body)
+                    
+                    # Format as complete email
+                    email_content = f"Subject: {email_subject}\n\n{email_body}"
+                    logger.info(f"PolicyEdge email generated for violation category: {violation_category}")
+                    
+                except json.JSONDecodeError:
+                    logger.warning("Could not parse JSON response, using raw content")
+                    email_content = response.choices[0].message.content
+                    email_content = self._add_signature(email_content)
+                    
+            else:
+                # Default system prompt for general notifications
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a professional healthcare compliance analyst. Generate clear, concise email notifications about healthcare facility enforcement actions. Use a professional but accessible tone."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    max_tokens=2000,
+                    temperature=0.7
+                )
+                email_content = response.choices[0].message.content
+            
+            logger.info("Email content generated successfully")
+            return email_content
+            
+        except Exception as e:
+            logger.error(f"Error generating email content: {str(e)}")
+            # Fallback to basic email template
+            return self._create_fallback_email(processed_entries)
+    
+    def _prepare_entries_summary(self, processed_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Prepare a summary of entries for ChatGPT."""
+        summary = []
+        
+        for entry in processed_entries:
+            structured = entry.get('structured_data', {})
+            pdf_data = entry.get('pdf_data', {})
+            
+            summary.append({
+                'facility_name': structured.get('facility_name', 'Unknown Facility'),
+                'enforcement_action_type': structured.get('enforcement_action_type', 'Unknown Action'),
+                'enforcement_date': structured.get('enforcement_date', 'Unknown Date'),
+                'penalty_amount': structured.get('penalty_amount', ''),
+                'violation_summary': structured.get('violation_summary', ''),
+                'severity_level': structured.get('severity_level', 'LOW'),
+                'priority_score': structured.get('priority_score', 0),
+                'key_violations': structured.get('key_violations', [])[:3],  # First 3 violations
+                'pdf_data': pdf_data  # Include PDF data for administrator info
+            })
+        
+        return summary
+    
+    def _create_email_prompt(self, entries_summary: List[Dict[str, Any]], count: int) -> str:
+        """Create a prompt for ChatGPT to generate email content."""
+        prompt = f"""
+        Generate a professional email notification about {count} new healthcare facility enforcement action(s) in New Jersey.
+        
+        Here are the details:
+        
+        """
+        
+        for i, entry in enumerate(entries_summary, 1):
+            prompt += f"""
+        {i}. Facility: {entry['facility_name']}
+           Action Type: {entry['enforcement_action_type']}
+           Date: {entry['enforcement_date']}
+           Severity: {entry['severity_level']}
+           Priority Score: {entry['priority_score']}/100
+           """
+            
+            if entry['penalty_amount']:
+                prompt += f"           Penalty: {entry['penalty_amount']}\n"
+            
+            if entry['violation_summary']:
+                prompt += f"           Violations: {entry['violation_summary'][:200]}...\n"
+            
+            if entry['key_violations']:
+                prompt += f"           Key Issues: {'; '.join(entry['key_violations'][:2])}\n"
+            
+            prompt += "\n"
+        
+        prompt += """
+        Please generate a professional email that:
+        1. Has a clear, informative subject line
+        2. Provides a brief summary of the enforcement actions
+        3. Highlights the most critical issues
+        4. Includes actionable insights
+        5. Maintains a professional tone suitable for healthcare compliance professionals
+        
+        Format the email in HTML for better readability.
+        """
+        
+        return prompt
+    
+    def _create_custom_email_prompt(self, entries_summary: List[Dict[str, Any]], custom_prompt: str) -> str:
+        """Create a custom email prompt with the provided template."""
+        # For PolicyEdge prompt, we need to format each facility individually
+        # This will generate one email per facility
+        if len(entries_summary) > 0:
+            entry = entries_summary[0]  # Process first entry for now
+            
+            # Extract penalty amount (remove $ and commas for processing)
+            penalty_str = entry.get('penalty_amount', '').replace('$', '').replace(',', '')
+            penalty_amount = penalty_str if penalty_str.isdigit() else '0'
+            
+            # Extract violation types from summary and key violations
+            violation_types = []
+            if entry.get('key_violations'):
+                violation_types.extend(entry['key_violations'][:3])
+            elif entry.get('violation_summary'):
+                # Extract common violation keywords
+                summary = entry['violation_summary'].lower()
+                if 'staffing' in summary:
+                    violation_types.append('staffing violations')
+                if 'medication' in summary:
+                    violation_types.append('medication administration')
+                if 'infection' in summary:
+                    violation_types.append('infection control')
+                if 'quality' in summary:
+                    violation_types.append('quality of care')
+                if 'documentation' in summary:
+                    violation_types.append('documentation requirements')
+            
+            if not violation_types:
+                violation_types = ['compliance violations']
+            
+            # Get administrator information from PDF data
+            pdf_data = entry.get('pdf_data', {}) if 'pdf_data' in entry else {}
+            admin_first_name = pdf_data.get('administrator_first_name', 'Administrator')
+            admin_full_name = pdf_data.get('administrator_name', 'Administrator')
+            
+            # Replace template variables in the custom prompt
+            formatted_prompt = custom_prompt.replace('{{ $json.administrator_first_name }}', admin_first_name)
+            formatted_prompt = formatted_prompt.replace('{{ $json.administrator_name }}', admin_full_name)
+            formatted_prompt = formatted_prompt.replace('{{ $json.facility_name }}', entry.get('facility_name', 'Healthcare Facility'))
+            formatted_prompt = formatted_prompt.replace('{{ $json.penalty_amount }}', penalty_amount)
+            formatted_prompt = formatted_prompt.replace('{{ $json.violation_types.join(\', \') }}', ', '.join(violation_types))
+            formatted_prompt = formatted_prompt.replace('{{ $json.law_violated }}', entry.get('enforcement_action_type', 'Healthcare regulations'))
+            formatted_prompt = formatted_prompt.replace('{{ $json.administrator_email }}', 'administrator@facility.com')
+            
+            return formatted_prompt
+        
+        # Fallback to original format if no entries
+        return custom_prompt
+    
+    def _create_fallback_email(self, processed_entries: List[Dict[str, Any]]) -> str:
+        """Create a fallback email template if ChatGPT fails."""
+        subject = f"NJ Health Facility Enforcement Actions - {len(processed_entries)} New Entries"
+        
+        html_content = f"""
+        <html>
+        <body>
+        <h2>New Jersey Health Facility Enforcement Actions Alert</h2>
+        <p>We have identified {len(processed_entries)} new enforcement action(s) in New Jersey healthcare facilities.</p>
+        
+        <h3>Summary of Actions:</h3>
+        <ul>
+        """
+        
+        for entry in processed_entries:
+            structured = entry.get('structured_data', {})
+            facility_name = structured.get('facility_name', 'Unknown Facility')
+            action_type = structured.get('enforcement_action_type', 'Unknown Action')
+            date = structured.get('enforcement_date', 'Unknown Date')
+            severity = structured.get('severity_level', 'LOW')
+            
+            html_content += f"""
+            <li>
+                <strong>{facility_name}</strong><br>
+                Action: {action_type}<br>
+                Date: {date}<br>
+                Severity: {severity}
+            </li>
+            """
+        
+        html_content += """
+        </ul>
+        
+        <p>Please review the full details in the attached documents or visit the NJ Department of Health website.</p>
+        
+        <p>Best regards,<br>
+        NJ Health Facility Monitor</p>
+        </body>
+        </html>
+        """
+        
+        return f"Subject: {subject}\n\n{html_content}"
+    
+    def send_email(self, email_content: str) -> bool:
+        """
+        Send email using Gmail API.
+        
+        Args:
+            email_content: The email content to send
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Parse subject and body from email content
+            subject, body = self._parse_email_content(email_content)
+            
+            # Create message
+            message = MIMEMultipart('alternative')
+            message['to'] = self.recipient_email
+            message['from'] = self.sender_email
+            message['subject'] = subject
+            
+            # Add HTML body
+            html_part = MIMEText(body, 'html')
+            message.attach(html_part)
+            
+            # Encode message
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+            
+            # Send email
+            send_message = self.gmail_service.users().messages().send(
+                userId='me',
+                body={'raw': raw_message}
+            ).execute()
+            
+            logger.info(f"Email sent successfully. Message ID: {send_message['id']}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error sending email: {str(e)}")
+            return False
+    
+    def _parse_email_content(self, email_content: str) -> tuple:
+        """Parse email content to extract subject and body."""
+        lines = email_content.split('\n')
+        subject = "NJ Health Facility Enforcement Actions Alert"
+        body = email_content
+        
+        # Look for subject line
+        for line in lines:
+            if line.startswith('Subject:'):
+                subject = line.replace('Subject:', '').strip()
+                break
+        
+        # Remove subject line from body if present
+        if 'Subject:' in email_content:
+            body = email_content.split('Subject:')[1].split('\n', 1)[1] if '\n' in email_content.split('Subject:')[1] else email_content.split('Subject:')[1]
+        
+        return subject, body
+    
+    def _add_signature(self, email_body: str) -> str:
+        """Add Eric Hansen's signature to the email body."""
+        # Professional email signature
+        # Eric's actual signature
+        signature = """
+--
+Best,
+
+Eric J. Hansen
+Co-Founder​
+policyedge
+New York | DC
+"""        
+        # Replace [Your Name] or similar placeholders
+        email_body = email_body.replace('[Your Name]', '').replace('Best,\n[Your Name]', '').replace('Best regards,\n[Your Name]', '')
+        
+        # Remove any trailing "Best," or "Best regards," without name
+        # Remove AI-generated signatures more thoroughly
+        import re
+        
+        # Remove various signature patterns that AI might generate
+        patterns_to_remove = [
+            r"Best regards,.*?Eric Hansen.*?PolicyEdge.*?(?=nn|$)",
+            r"Best,.*?Eric Hansen.*?(?=nn|$)",
+            r"Sincerely,.*?Eric Hansen.*?(?=nn|$)",
+            r"[Your Name]",
+            r"Best,s*ns*[Your Name]",
+            r"Best regards,s*ns*[Your Name]"
+        ]
+        
+        for pattern in patterns_to_remove:
+            email_body = re.sub(pattern, "", email_body, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Clean up any trailing signature-like content
+        email_body = email_body.rstrip()
+
+        return email_body + signature
+
+    def send_email_to_facility(self, processed_entry: Dict[str, Any], custom_prompt: str = None) -> bool:
+        email_body = email_body.rstrip()    def send_email_to_facility(self, processed_entry: Dict[str, Any], custom_prompt: str = None) -> bool:
+        """
+        Send email to a specific facility administrator.
+        
+        Args:
+            processed_entry: Processed enforcement action entry
+            custom_prompt: Optional custom prompt for email generation
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            structured = processed_entry.get('structured_data', {})
+            pdf_data = processed_entry.get('pdf_data', {})
+            
+            # Get administrator email (you'll need to extract this from PDFs or use a lookup)
+            admin_email = pdf_data.get('administrator_email', self.recipient_email)
+            facility_name = structured.get('facility_name', 'Healthcare Facility')
+            
+            logger.info(f"Generating email for {facility_name}")
+            
+            # Generate email content
+            email_content = self.generate_email_content([processed_entry], custom_prompt)
+            
+            # Parse email content
+            subject, body = self._parse_email_content(email_content)
+            
+            # Create and send email
+            return self._send_gmail(admin_email, subject, body)
+            
+        except Exception as e:
+            logger.error(f"Error sending email to facility: {str(e)}")
+            return False
+    
+    def _send_gmail(self, to_email: str, subject: str, body: str) -> bool:
+        """Send email using Gmail API."""
+        try:
+            # Create message
+            message = MIMEMultipart('alternative')
+            message['to'] = to_email
+            message['from'] = self.sender_email
+            message['subject'] = subject
+            
+            # Add HTML body
+            html_part = MIMEText(body, 'html' if '<' in body else 'plain')
+            message.attach(html_part)
+            
+            # Encode message
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+            
+            # Send email
+            send_message = self.gmail_service.users().messages().send(
+                userId='me',
+                body={'raw': raw_message}
+            ).execute()
+            
+            logger.info(f"Email sent successfully to {to_email}. Message ID: {send_message['id']}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error sending Gmail: {str(e)}")
+            return False
+    
+    def test_email_connection(self) -> bool:
+        """Test the email connection and credentials."""
+        try:
+            # Try to get user profile to test connection
+            profile = self.gmail_service.users().getProfile(userId='me').execute()
+            logger.info(f"Email connection test successful. User: {profile.get('emailAddress')}")
+            return True
+        except Exception as e:
+            logger.error(f"Email connection test failed: {str(e)}")
+            return False

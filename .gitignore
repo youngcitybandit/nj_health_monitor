@@ -1,0 +1,25 @@
+# Environment files
+.env
+token.json
+credentials.json
+your_env_file.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.log
+
+# IDE
+.vscode/
+.DS_Store
+
+# Test files
+test_*.py
+*_backup.py
+
+# Deployment artifacts
+*.zip
+policyedge-ai-deployment/

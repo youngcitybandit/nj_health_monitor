@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+README.md
+.env
+.DS_Store
+*.log
+test_*.py
+*_backup.py
+gmail_setup_instructions.md
+setup_gmail.py
+quick_gmail_setup.py

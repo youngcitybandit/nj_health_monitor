@@ -1,0 +1,17 @@
+# OpenAI API Configuration
+OPENAI_API_KEY=your_openai_api_key_here
+
+# Supabase Configuration
+SUPABASE_URL=your_supabase_url_here
+SUPABASE_KEY=your_supabase_anon_key_here
+
+# Gmail API Configuration
+GMAIL_CREDENTIALS_FILE=credentials.json
+GMAIL_TOKEN_FILE=token.json
+
+# Email Configuration
+SENDER_EMAIL=your_email@gmail.com
+RECIPIENT_EMAIL=recipient@example.com
+
+# Selenium Configuration (for headless browser)
+CHROME_DRIVER_PATH=/usr/local/bin/chromedriver
